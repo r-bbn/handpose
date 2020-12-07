@@ -1,7 +1,12 @@
+// Set the backen used by TensorFlow
+// See https://www.tensorflow.org/js/guide/platform_environment
 const state = {
     backend: 'webgl'
+    //backend: 'wasm'
+    //backend: 'cpu'
 };
 
+// Detect if mobile user
 function isMobile() {
     const isAndroid = /Android/i.test(navigator.userAgent);
     const isiOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
@@ -12,7 +17,10 @@ const VIDEO_WIDTH = 640;
 const VIDEO_HEIGHT = 500;
 const mobile = isMobile();
 
-let videoWidth, videoHeight, canvas, ctx, rafID, fingerLookupIndices = {
+let videoWidth, videoHeight, canvas, ctx, rafID, model;
+
+// Indices by finger used to draw the keypoints and paths between them
+let fingerLookupIndices = {
     thumb: [0, 1, 2, 3, 4],
     indexFinger: [0, 5, 6, 7, 8],
     middleFinger: [0, 9, 10, 11, 12],
@@ -20,11 +28,9 @@ let videoWidth, videoHeight, canvas, ctx, rafID, fingerLookupIndices = {
     pinky: [0, 17, 18, 19, 20]
 };
 
-let model;
-
 /**
- * Load video
- * @returns {Promise<unknown>}
+ * Setup the camera and return a video object with
+ * an attached stream corresponding to the webcam
  */
 async function setupCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -33,6 +39,8 @@ async function setupCamera() {
     }
 
     const video = document.getElementById('video');
+
+    // Get video stream from the webcam
     const stream = await navigator.mediaDevices.getUserMedia({
         'audio': false,
         'video': {
@@ -43,6 +51,8 @@ async function setupCamera() {
             height: mobile ? undefined : VIDEO_HEIGHT
         },
     });
+
+    // Attach it to the video
     video.srcObject = stream;
 
     return new Promise((resolve) => {
@@ -52,12 +62,20 @@ async function setupCamera() {
     });
 }
 
+/**
+ * Load the video
+ */
 async function loadVideo() {
     const video = await setupCamera();
     video.play();
     return video;
 }
 
+/**
+ * Draw the keypoints predicted by the model
+ * See the structure of the "prediction" object in the main() function
+ * @param keypoints
+ */
 function drawKeypoints(keypoints) {
     const keypointsArray = keypoints;
 
@@ -75,12 +93,23 @@ function drawKeypoints(keypoints) {
     }
 }
 
+/**
+ * Draw a point on the canvas
+ * @param y coordinate
+ * @param x coordinate
+ * @param r radius of the circle to fill
+ */
 function drawPoint(y, x, r) {
     ctx.beginPath();
     ctx.arc(x, y, r, 0, 2 * Math.PI);
     ctx.fill();
 }
 
+/**
+ * Draw a path between the points of the fingers
+ * @param points
+ * @param closePath
+ */
 function drawPath(points, closePath) {
     const region = new Path2D();
     region.moveTo(points[0][0], points[0][1]);
@@ -95,164 +124,156 @@ function drawPath(points, closePath) {
     ctx.stroke(region);
 }
 
-function detect_close_hands(predictions) {
+/**
+ * Detect if the hand in the video is closed
+ * @param predictions (the prediction object of the model)
+ * @returns hand closed (true/false)
+ */
+function detectClosedHand(predictions) {
 
-    let indexFinger = predictions[0].annotations.indexFinger;
-    let ringFinger = predictions[0].annotations.indexFinger;
-    let pinky = predictions[0].annotations.pinky;
-    let middleFinger = predictions[0].annotations.middleFinger;
+    // Get fingers (not thumb and palmBase, see prediction object in console)
 
-    let nbClosedFingers = detectClosedFinger(indexFinger) + detectClosedFinger(ringFinger) + detectClosedFinger(pinky) + detectClosedFinger(middleFinger);
+    let nbClosed = 0;
 
-    return nbClosedFingers >= 2;
+    let keys = Object.keys(predictions[0].annotations);
+    keys.forEach(key => {
+        if(key != "thumb" && key != "palmBase") {
+            nbClosed += detectClosedFinger(predictions[0].annotations[key]);
+        }
+    })
+
+    // Detect the number of closed fingers
+
+    // If it is >= 2, the hand is considered closed
+
+    return nbClosed >= 2;
 }
 
+/**
+ * Detect if a finger is closed
+ * @param finger
+ *  * The structure of a finger is the following :
+ * finger {
+ *     [
+ *         [x0, y0, z0] (1st point coordinates = Bottom)
+ *         [x1, y1, z1] (2nd point)
+ *         [x2, y2, z2] (3rd point)
+ *         [x3, y3, z3] (4th point = Top)
+ *     ]
+ * }
+ * @returns 1 if closed, 0 otherwise
+ */
 function detectClosedFinger(finger) {
+
+    // Get yTop & yBottom
     let yTop = finger[3][1]
     let yDown = finger[0][1]
 
-    // 'y' croit lorsqu'on va vers le bas
+    // Return 1 if finger closed, 0 otherwise
+    // Warning ! See how the "y" axis is defined !
     if(yTop > yDown) {
         return 1;
-    }
-    else {
+    } else {
         return 0;
     }
 }
 
-function drawExtremeFingerPoint(finger) {
-    let x = finger[3][0]
-    let y = finger[3][1]
+/**
+ * Function used to analyse the frames produced by the video stream using Tensorflow
+ * @param video (the video stream)
+ * @param audio (the audio file that will be play)
+ */
+const landmarksRealTime = async (video, audio) => {
 
-    drawPoint(y-2, x-2, 3)
+    async function frameLandmarks() {
+        // Draw canvas image using the webcam video stream
+        ctx.drawImage(
+            video, 0, 0, videoWidth, videoHeight, 0, 0, canvas.width,
+            canvas.height);
 
-    x = finger[1][0]
-    y = finger[1][1]
+        const predictions = await model.estimateHands(video);
 
-    drawPoint(y-2, x-2, 3)
-}
+        // If there is a result, forward to analysis
+        if (predictions.length > 0) {
 
+            // See the structure of the prediction object here :
+            // https://github.com/tensorflow/tfjs-models/tree/master/handpose
+
+            // You can log it to see further details
+            console.log("Predictions", predictions);
+
+            const result = predictions[0].landmarks;
+            drawKeypoints(result);
+
+            // Detect if the hand is closed, and play audio
+            if(detectClosedHand(predictions)) {
+                audio.pause();
+                console.log('Close');
+            } else {
+                audio.play();
+                console.log('Open');
+            }
+        }
+        // Otherwise if no hands are detected
+        else {
+            audio.pause();
+            console.log('No hand');
+        }
+        // Launch new analysis for the next frame
+        rafID = requestAnimationFrame(frameLandmarks);
+    };
+
+    // Launch the function
+    frameLandmarks();
+};
+
+/**
+ * Main Function
+ */
 async function main() {
     await tf.setBackend(state.backend);
     model = await handpose.load();
-    let video;
 
+    // Load the webcam video stream
+    let video;
     try {
         video = await loadVideo();
     } catch (e) {
+        // If error, display message
         let info = document.getElementById('info');
         info.textContent = e.message;
         info.style.display = 'block';
         throw e;
     }
 
-    //setupDatGui();
-
+    // Set dimensions
     videoWidth = video.videoWidth;
     videoHeight = video.videoHeight;
 
+    // Set dimensions of the canvas where the video is displayed
     canvas = document.getElementById('output');
     canvas.width = videoWidth;
     canvas.height = videoHeight;
     video.width = videoWidth;
     video.height = videoHeight;
 
+    // Set canvas context
     ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, videoWidth, videoHeight);
     ctx.strokeStyle = 'red';
     ctx.fillStyle = 'red';
-
     ctx.translate(canvas.width, 0);
     ctx.scale(-1, 1);
-
-    // // These anchor points allow the hand pointcloud to resize according to its
-    // // position in the input.
-    // ANCHOR_POINTS = [
-    //     [0, 0, 0], [0, -VIDEO_HEIGHT, 0], [-VIDEO_WIDTH, 0, 0],
-    //     [-VIDEO_WIDTH, -VIDEO_HEIGHT, 0]
-    // ];
-    //
-    // if (renderPointcloud) {
-    //     document.querySelector('#scatter-gl-container').style =
-    //         `width: ${VIDEO_WIDTH}px; height: ${VIDEO_HEIGHT}px;`;
-    //
-    //     scatterGL = new ScatterGL(
-    //         document.querySelector('#scatter-gl-container'),
-    //         {'rotateOnStart': false, 'selectEnabled': false});
-    // }
-    //
 
     // Load Audio
     let audio = new Audio('./resources/music.mp3');
     audio.loop = true;
 
-    // Launch frame analysis
     landmarksRealTime(video, audio);
 }
-
-const landmarksRealTime = async (video, audio) => {
-    async function frameLandmarks() {
-        // stats.begin();
-        ctx.drawImage(
-            video, 0, 0, videoWidth, videoHeight, 0, 0, canvas.width,
-            canvas.height);
-        const predictions = await model.estimateHands(video);
-
-        if (predictions.length > 0) {
-            const result = predictions[0].landmarks;
-            drawKeypoints(result, predictions[0].annotations);
-
-            // Detect if the hand is closed..
-
-            if(detect_close_hands(predictions)) {
-                audio.pause();
-                console.log('Close');
-            } else {
-                audio.play();
-                console.log('Open')
-            }
-
-            // if (renderPointcloud === true && scatterGL != null) {
-            //     const pointsData = result.map(point => {
-            //         return [-point[0], -point[1], -point[2]];
-            //     });
-            //
-            //     const dataset =
-            //         new ScatterGL.Dataset([...pointsData, ...ANCHOR_POINTS]);
-            //
-            //     if (!scatterGLHasInitialized) {
-            //         scatterGL.render(dataset);
-            //
-            //         const fingers = Object.keys(fingerLookupIndices);
-            //
-            //         scatterGL.setSequences(
-            //             fingers.map(finger => ({indices: fingerLookupIndices[finger]})));
-            //         scatterGL.setPointColorer((index) => {
-            //             if (index < pointsData.length) {
-            //                 return 'steelblue';
-            //             }
-            //             return 'white';  // Hide.
-            //         });
-            //     } else {
-            //         scatterGL.updateDataset(dataset);
-            //     }
-            //     scatterGLHasInitialized = true;
-            // }
-        }
-        else {
-            // Si on ne détecte pas de mains
-            audio.pause();
-            console.log('No hand')
-        }
-        // stats.end();
-        rafID = requestAnimationFrame(frameLandmarks);
-    };
-
-    // Appel en boucle
-    frameLandmarks();
-};
 
 navigator.getUserMedia = navigator.getUserMedia ||
     navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
 
+// Execution of the main
 main();
